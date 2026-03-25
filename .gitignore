@@ -1,0 +1,40 @@
+# Environment
+.env
+.env.local
+.env.production
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Node
+node_modules/
+.next/
+.turbo/
+out/
+
+# Docker volumes (local overrides)
+postgres_data/
+redis_data/
+
+# Nuclei outputs
+/opt/nuclei-output/
+*.json.tmp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Alembic versions (generated)
+backend/alembic/versions/*.py
