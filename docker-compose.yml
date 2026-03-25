@@ -5,24 +5,28 @@ x-backend-env: &backend-env
   REDIS_URL: redis://redis:6379/0
   CELERY_BROKER_URL: redis://redis:6379/0
   CELERY_RESULT_BACKEND: redis://redis:6379/1
-  SECRET_KEY: ${SECRET_KEY:-change-me-in-production-use-openssl-rand-hex-32}
+  SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set — run: openssl rand -hex 32}
   NUCLEI_BINARY: /usr/local/bin/nuclei
   NUCLEI_TEMPLATES_DIR: /opt/nuclei-templates
   NUCLEI_CUSTOM_TEMPLATES_DIR: /opt/custom-templates
   NUCLEI_OUTPUT_DIR: /opt/nuclei-output
   FIRST_ADMIN_EMAIL: ${FIRST_ADMIN_EMAIL:-admin@nucleicloud.local}
   FIRST_ADMIN_PASSWORD: ${FIRST_ADMIN_PASSWORD:-changeme123!}
-  ALLOWED_ORIGINS: '["http://localhost", "http://localhost:3000"]'
+  ALLOWED_ORIGINS: '["http://localhost", "https://localhost"]'
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  SCAN_TIMEOUT_SECONDS: ${SCAN_TIMEOUT_SECONDS:-3600}
+  MAX_TARGETS_PER_SCAN: ${MAX_TARGETS_PER_SCAN:-10000}
+  MAX_FINDINGS_PER_SCAN: ${MAX_FINDINGS_PER_SCAN:-50000}
 
 services:
-  # ── Database ────────────────────────────────────────────────────────────────
+  # ── Database ──────────────────────────────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
       POSTGRES_DB: nuclei_cloud
       POSTGRES_USER: nuclei
-      POSTGRES_PASSWORD: nucleipass
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nucleipass}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -32,12 +36,17 @@ services:
       retries: 5
     networks:
       - internal
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
 
-  # ── Cache / Queue ─────────────────────────────────────────────────────────
+  # ── Cache / Queue ─────────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
     volumes:
       - redis_data:/data
     healthcheck:
@@ -47,8 +56,13 @@ services:
       retries: 5
     networks:
       - internal
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 384M
 
-  # ── FastAPI Backend ───────────────────────────────────────────────────────
+  # ── FastAPI Backend ───────────────────────────────────────────────────────────
   backend:
     build:
       context: ./backend
@@ -68,12 +82,18 @@ services:
     networks:
       - internal
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
       timeout: 10s
+      start_period: 60s
       retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
 
-  # ── Celery Worker (Scans queue) ───────────────────────────────────────────
+  # ── Celery Worker — Scans ─────────────────────────────────────────────────────
   worker-scans:
     build:
       context: ./backend
@@ -91,15 +111,22 @@ services:
       - nuclei_templates:/opt/nuclei-templates
       - custom_templates:/opt/custom-templates
       - nuclei_output:/opt/nuclei-output
+      - ./scripts:/app/scripts:ro
     networks:
       - internal
+    healthcheck:
+      test: ["CMD", "/app/scripts/worker_healthcheck.sh"]
+      interval: 60s
+      timeout: 15s
+      start_period: 30s
+      retries: 3
     deploy:
       resources:
         limits:
-          cpus: "2"
-          memory: 2G
+          cpus: "4"
+          memory: 4G
 
-  # ── Celery Worker (Notifications queue) ──────────────────────────────────
+  # ── Celery Worker — Notifications ─────────────────────────────────────────────
   worker-notifications:
     build:
       context: ./backend
@@ -113,8 +140,19 @@ services:
         condition: service_healthy
     networks:
       - internal
+    healthcheck:
+      test: ["CMD", "celery", "-A", "app.workers.celery_app", "inspect", "ping", "--destination", "celery@$$HOSTNAME", "--timeout", "5"]
+      interval: 60s
+      timeout: 15s
+      start_period: 30s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
 
-  # ── Celery Beat (Scheduler) ───────────────────────────────────────────────
+  # ── Celery Beat — Scheduler ───────────────────────────────────────────────────
   celery-beat:
     build:
       context: ./backend
@@ -128,25 +166,39 @@ services:
         condition: service_healthy
     networks:
       - internal
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
 
-  # ── Flower (Celery monitoring) ────────────────────────────────────────────
+  # ── Flower — Celery Monitoring (internal only) ────────────────────────────────
   flower:
     build:
       context: ./backend
       dockerfile: Dockerfile
     restart: unless-stopped
-    command: celery -A app.workers.celery_app flower --port=5555 --basic_auth=${FLOWER_USER:-admin}:${FLOWER_PASSWORD:-flowerpass}
+    command: >
+      celery -A app.workers.celery_app flower
+        --port=5555
+        --basic_auth=${FLOWER_USER:-admin}:${FLOWER_PASSWORD:-flowerpass}
+        --url_prefix=flower
     environment:
       <<: *backend-env
-    ports:
-      - "5555:5555"
+    expose:
+      - "5555"   # NOT published to host — accessible only via nginx /flower
     depends_on:
       redis:
         condition: service_healthy
     networks:
       - internal
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
 
-  # ── Next.js Frontend ──────────────────────────────────────────────────────
+  # ── Next.js Frontend ──────────────────────────────────────────────────────────
   frontend:
     build:
       context: ./frontend
@@ -158,21 +210,110 @@ services:
       - internal
     depends_on:
       - backend
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/', (r) => process.exit(r.statusCode < 500 ? 0 : 1))"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
 
-  # ── Nginx Reverse Proxy ───────────────────────────────────────────────────
+  # ── Nginx Reverse Proxy ───────────────────────────────────────────────────────
   nginx:
     image: nginx:1.27-alpine
     restart: unless-stopped
     ports:
       - "80:80"
+      - "443:443"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro          # Mount TLS certificates here
+      - certbot_www:/var/www/certbot:ro        # For Let's Encrypt ACME challenges
     depends_on:
       - backend
       - frontend
     networks:
       - internal
       - external
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 64M
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # TEST TARGET CONTAINERS
+  # Vulnerable apps used for real integration tests.
+  # Only started when running: docker compose --profile test up
+  # ─────────────────────────────────────────────────────────────────────────────
+
+  # DVWA — Damn Vulnerable Web Application
+  target-dvwa:
+    image: vulnerables/web-dvwa:latest
+    restart: unless-stopped
+    profiles: ["test"]
+    networks:
+      - internal
+    environment:
+      - RECAPTCHA_PRIV_KEY=
+      - RECAPTCHA_PUB_KEY=
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:80/"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  # Nginx 1.14 — has known server-version disclosure (nuclei http/technologies)
+  target-nginx-old:
+    image: nginx:1.14-alpine
+    restart: unless-stopped
+    profiles: ["test"]
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:80/"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 32M
+
+  # Juice Shop — OWASP deliberately insecure Node.js app
+  target-juiceshop:
+    image: bkimminich/juice-shop:latest
+    restart: unless-stopped
+    profiles: ["test"]
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
 
 volumes:
   postgres_data:
@@ -180,6 +321,7 @@ volumes:
   nuclei_templates:
   custom_templates:
   nuclei_output:
+  certbot_www:
 
 networks:
   internal:

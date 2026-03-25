@@ -181,7 +181,12 @@ async def stream_scan_events(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Server-Sent Events stream for real-time scan updates."""
+    """Server-Sent Events stream for real-time scan updates.
+
+    Uses cursor-based pagination (id > last_id) instead of OFFSET to avoid O(n)
+    query growth. Detects client disconnect via GeneratorExit/CancelledError.
+    Hard timeout of 3600s prevents zombie generators.
+    """
     result = await db.execute(select(Scan).where(Scan.id == scan_id))
     scan = result.scalar_one_or_none()
     if not scan:
@@ -189,49 +194,90 @@ async def stream_scan_events(
     if current_user.role != UserRole.ADMIN and scan.owner_id != current_user.id:
         raise HTTPException(status_code=403, detail="Access denied")
 
+    # Use a fresh session per generator to avoid stale state on the shared session
+    from app.database import AsyncSessionLocal
+
     async def event_generator():
-        last_finding_count = 0
-        while True:
-            result = await db.execute(select(Scan).where(Scan.id == scan_id))
-            scan = result.scalar_one_or_none()
-            if not scan:
-                break
+        last_finding_id: Optional[str] = None
+        deadline = asyncio.get_event_loop().time() + 3600  # hard 1-hour cap
 
-            findings_q = await db.execute(
-                select(Finding)
-                .where(Finding.scan_id == scan_id)
-                .order_by(Finding.created_at.desc())
-                .limit(10)
-                .offset(last_finding_count)
-            )
-            new_findings = findings_q.scalars().all()
+        async with AsyncSessionLocal() as stream_db:
+            try:
+                while asyncio.get_event_loop().time() < deadline:
+                    # Refresh scan state
+                    scan_res = await stream_db.execute(
+                        select(Scan).where(Scan.id == scan_id)
+                    )
+                    current_scan = scan_res.scalar_one_or_none()
+                    if not current_scan:
+                        break
 
-            event_data = {
-                "status": scan.status.value,
-                "total_findings": scan.total_findings,
-                "critical": scan.critical_count,
-                "high": scan.high_count,
-                "new_findings": [
-                    {
-                        "id": f.id,
-                        "template_name": f.template_name,
-                        "severity": f.severity.value,
-                        "matched_at": f.matched_at,
+                    # Cursor-based query: only fetch findings AFTER last seen id
+                    findings_query = (
+                        select(Finding)
+                        .where(Finding.scan_id == scan_id)
+                        .order_by(Finding.created_at.asc(), Finding.id.asc())
+                        .limit(20)
+                    )
+                    if last_finding_id:
+                        # Fetch only rows created after the last known finding
+                        anchor_res = await stream_db.execute(
+                            select(Finding.created_at).where(Finding.id == last_finding_id)
+                        )
+                        anchor_ts = anchor_res.scalar_one_or_none()
+                        if anchor_ts:
+                            findings_query = findings_query.where(
+                                Finding.created_at > anchor_ts
+                            )
+
+                    findings_res = await stream_db.execute(findings_query)
+                    new_findings = findings_res.scalars().all()
+
+                    if new_findings:
+                        last_finding_id = new_findings[-1].id
+
+                    event_data = {
+                        "status": current_scan.status.value,
+                        "total_findings": current_scan.total_findings,
+                        "critical": current_scan.critical_count,
+                        "high": current_scan.high_count,
+                        "new_findings": [
+                            {
+                                "id": f.id,
+                                "template_name": f.template_name,
+                                "severity": f.severity.value,
+                                "matched_at": f.matched_at,
+                            }
+                            for f in new_findings
+                        ],
                     }
-                    for f in new_findings
-                ],
-            }
-            last_finding_count += len(new_findings)
-            yield f"data: {json.dumps(event_data)}\n\n"
 
-            if scan.status in (ScanStatus.DONE, ScanStatus.FAILED, ScanStatus.CANCELLED):
-                yield "data: {\"done\": true}\n\n"
-                break
+                    try:
+                        yield f"data: {json.dumps(event_data)}\n\n"
+                    except (GeneratorExit, asyncio.CancelledError):
+                        # Client disconnected — stop immediately
+                        return
 
-            await asyncio.sleep(3)
+                    if current_scan.status in (
+                        ScanStatus.DONE, ScanStatus.FAILED, ScanStatus.CANCELLED
+                    ):
+                        yield 'data: {"done": true}\n\n'
+                        break
+
+                    await asyncio.sleep(3)
+
+                # Timeout reached
+                yield 'data: {"done": true, "reason": "timeout"}\n\n'
+
+            except (GeneratorExit, asyncio.CancelledError):
+                pass  # Client disconnected gracefully
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
     )

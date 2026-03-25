@@ -1,8 +1,10 @@
 import re
 import uuid
+import ipaddress
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, delete
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from typing import List, Optional
 from app.database import get_db
 from app.models.user import User, UserRole
@@ -16,19 +18,126 @@ from app.api.deps import get_current_user
 
 router = APIRouter(prefix="/targets", tags=["targets"])
 
+# Protocols that must never be scanned (SSRF / injection risks)
+_BLOCKED_PROTOCOLS = re.compile(
+    r"^(javascript|data|file|ftp|ldap|ldaps|gopher|dict|tftp|sftp|mailto)://",
+    re.IGNORECASE,
+)
+# Block control characters, newlines, null bytes in any target value
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+# Private / loopback / link-local ranges — not allowed as scan targets
+_SSRF_NETWORKS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),   # AWS/Azure metadata
+    ipaddress.ip_network("100.64.0.0/10"),    # Shared address space
+    ipaddress.ip_network("::1/128"),           # IPv6 loopback
+    ipaddress.ip_network("fc00::/7"),          # IPv6 ULA
+]
+
+
+def _is_ssrf_ip(addr_str: str) -> bool:
+    """Return True if the address belongs to a private/loopback/SSRF-risk range."""
+    try:
+        addr = ipaddress.ip_address(addr_str)
+        return any(addr in net for net in _SSRF_NETWORKS)
+    except ValueError:
+        return False
+
+
+def _validate_target_value(value: str) -> str:
+    """
+    Sanitise and validate a raw target string.
+    Raises HTTPException 400 on any dangerous input.
+    Returns the cleaned value.
+    """
+    value = value.strip()
+    if not value:
+        raise HTTPException(status_code=400, detail="Target value cannot be empty")
+
+    if len(value) > 2048:
+        raise HTTPException(status_code=400, detail="Target value exceeds 2048 characters")
+
+    # Reject control characters (newlines, null bytes — CLI injection surface)
+    if _CONTROL_CHARS.search(value):
+        raise HTTPException(
+            status_code=400,
+            detail="Target value contains illegal control characters",
+        )
+
+    # Reject dangerous protocols
+    if _BLOCKED_PROTOCOLS.match(value):
+        raise HTTPException(
+            status_code=400,
+            detail="Blocked protocol. Only http://, https://, IPs, CIDRs, and domains are allowed",
+        )
+
+    # Protocol-specific validation
+    if re.match(r"^https?://", value, re.IGNORECASE):
+        # Block SSRF via hostname
+        host_match = re.match(r"^https?://([^/:?\s#]+)", value, re.IGNORECASE)
+        if host_match:
+            host = host_match.group(1)
+            # Block localhost
+            if host.lower() in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+                raise HTTPException(status_code=400, detail="Scanning localhost is not allowed")
+            # Block link-local / metadata endpoints
+            if _is_ssrf_ip(host):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Scanning private/loopback/metadata IP ranges is not allowed",
+                )
+        return value
+
+    # Validate CIDR
+    if re.match(r"^[\d.]+/\d+$", value) or re.match(r"^[0-9a-fA-F:]+/\d+$", value):
+        try:
+            net = ipaddress.ip_network(value, strict=False)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid CIDR notation: {value}")
+        if any(net.overlaps(blocked) for blocked in _SSRF_NETWORKS):
+            raise HTTPException(status_code=400, detail="CIDR overlaps with private/SSRF-risk ranges")
+        return value
+
+    # Validate plain IP
+    if re.match(r"^[\d.]+$", value) or re.match(r"^[0-9a-fA-F:]+$", value):
+        try:
+            ipaddress.ip_address(value)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid IP address: {value}")
+        if _is_ssrf_ip(value):
+            raise HTTPException(status_code=400, detail="Scanning private/SSRF-risk IPs is not allowed")
+        return value
+
+    # Domain: basic sanity check
+    if not re.match(r"^[a-zA-Z0-9]([a-zA-Z0-9\-\.]{0,251}[a-zA-Z0-9])?$", value):
+        raise HTTPException(status_code=400, detail=f"Invalid domain format: {value}")
+
+    if value.lower() in ("localhost",):
+        raise HTTPException(status_code=400, detail="Scanning localhost is not allowed")
+
+    return value
+
 
 def detect_target_type(value: str) -> TargetType:
-    value = value.strip()
-    if re.match(r"^https?://", value):
+    """Detect target type AFTER validation (value is already sanitised)."""
+    if re.match(r"^https?://", value, re.IGNORECASE):
         return TargetType.URL
-    if re.match(r"^\d{1,3}(\.\d{1,3}){3}/\d+$", value):
-        return TargetType.CIDR
-    if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", value):
+    try:
+        if "/" in value:
+            ipaddress.ip_network(value, strict=False)
+            return TargetType.CIDR
+        ipaddress.ip_address(value)
         return TargetType.IP
+    except ValueError:
+        pass
     return TargetType.DOMAIN
 
 
-# ── Targets ──────────────────────────────────────────────────────────────────
+# ── Targets ───────────────────────────────────────────────────────────────────
 
 @router.post("", response_model=TargetRead, status_code=201)
 async def create_target(
@@ -37,17 +146,19 @@ async def create_target(
     current_user: User = Depends(get_current_user),
     _: User = Depends(can_write),
 ):
+    clean_value = _validate_target_value(payload.value)
+
     # Dedup check
     result = await db.execute(
-        select(Target).where(Target.value == payload.value, Target.owner_id == current_user.id)
+        select(Target).where(Target.value == clean_value, Target.owner_id == current_user.id)
     )
     if result.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="Target already exists")
 
     target = Target(
         id=str(uuid.uuid4()),
-        value=payload.value.strip(),
-        type=payload.type,
+        value=clean_value,
+        type=detect_target_type(clean_value),
         tags=payload.tags,
         owner_id=current_user.id,
     )
@@ -64,14 +175,30 @@ async def import_targets(
     current_user: User = Depends(get_current_user),
     _: User = Depends(can_write),
 ):
-    """Bulk import targets with auto-detection and deduplication."""
+    """Bulk import targets with auto-detection, validation, and deduplication."""
+    from app.config import settings
+
+    if len(payload.targets) > settings.MAX_TARGETS_PER_SCAN:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot import more than {settings.MAX_TARGETS_PER_SCAN} targets at once",
+        )
+
     created = 0
     skipped = 0
+    rejected = 0
     target_ids = []
 
     for raw in payload.targets:
-        value = raw.strip()
-        if not value:
+        raw = raw.strip()
+        if not raw or raw.startswith("#"):
+            continue
+
+        # Validate — skip invalid entries with a count rather than failing the whole batch
+        try:
+            value = _validate_target_value(raw)
+        except HTTPException:
+            rejected += 1
             continue
 
         result = await db.execute(
@@ -94,7 +221,10 @@ async def import_targets(
             created += 1
             target_ids.append(target.id)
 
-    # Optionally add to a target list
+    # Flush new targets so we can reference their IDs
+    await db.flush()
+
+    # Optionally add to a target list (PostgreSQL ON CONFLICT DO NOTHING)
     if payload.target_list_id and target_ids:
         tl_result = await db.execute(
             select(TargetList).where(TargetList.id == payload.target_list_id)
@@ -102,15 +232,23 @@ async def import_targets(
         tl = tl_result.scalar_one_or_none()
         if tl:
             owns_or_admin(tl.owner_id, current_user)
-            for tid in target_ids:
-                await db.execute(
-                    target_list_targets.insert().prefix_with("OR IGNORE").values(
-                        target_list_id=payload.target_list_id, target_id=tid
-                    )
-                )
+            stmt = (
+                pg_insert(target_list_targets)
+                .values([
+                    {"target_list_id": payload.target_list_id, "target_id": tid}
+                    for tid in target_ids
+                ])
+                .on_conflict_do_nothing()
+            )
+            await db.execute(stmt)
 
     await db.commit()
-    return {"created": created, "skipped": skipped, "total": len(target_ids)}
+    return {
+        "created": created,
+        "skipped": skipped,
+        "rejected": rejected,
+        "total": len(target_ids),
+    }
 
 
 @router.post("/upload", response_model=dict)
@@ -121,10 +259,22 @@ async def upload_targets(
     current_user: User = Depends(get_current_user),
     _: User = Depends(can_write),
 ):
-    """Upload a text file with one target per line."""
-    content = await file.read()
-    lines = content.decode("utf-8").splitlines()
-    raw_targets = [line.strip() for line in lines if line.strip() and not line.startswith("#")]
+    """Upload a text file (max 10 MB) with one target per line."""
+    MAX_UPLOAD = 10 * 1024 * 1024  # 10 MB
+    content = await file.read(MAX_UPLOAD + 1)
+    if len(content) > MAX_UPLOAD:
+        raise HTTPException(status_code=413, detail="File too large (max 10 MB)")
+
+    try:
+        text = content.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="File must be valid UTF-8")
+
+    lines = text.splitlines()
+    raw_targets = [
+        line.strip() for line in lines
+        if line.strip() and not line.strip().startswith("#")
+    ]
     payload = TargetImport(targets=raw_targets, target_list_id=target_list_id)
     return await import_targets(payload, db, current_user, current_user)
 
